@@ -142,7 +142,17 @@ prev_axes = None              # Previous frame OBB rotation axes (3x3), for axis
 obb_smooth_center = None      # EMA-smoothed center
 obb_smooth_extent = None      # EMA-smoothed extent
 obb_smooth_R = None           # Smoothed rotation matrix
-OBB_SMOOTH = 0.75             # New frame weight
+OBB_SMOOTH = 0.75             # New frame weight for center & rotation (same as original)
+
+# --- Rigid body extent stabilization (only extent, not pose) ---
+from collections import deque
+EXTENT_WINDOW = 20                     # Sliding window size for median extent
+EXTENT_ALPHA_INIT = 0.4                # Initial EMA weight for extent (fast convergence)
+EXTENT_ALPHA_MIN = 0.02                # Minimum EMA weight (near-locked)
+EXTENT_ALPHA_DECAY = 0.92              # Per-frame decay multiplier
+EXTENT_MAX_CHANGE_RATE = 0.05          # Max allowed per-frame change ratio (5%)
+extent_history = deque(maxlen=EXTENT_WINDOW)  # Recent raw extents for median reference
+extent_frame_count = 0                 # Frames since tracking started (for alpha decay)
 
 def create_camera_frustum(fx_, fy_, cx_, cy_, w, h, scale=0.15):
     corners_2d = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
@@ -236,6 +246,8 @@ try:
             obb_smooth_center = None
             obb_smooth_extent = None
             obb_smooth_R = None
+            extent_history.clear()
+            extent_frame_count = 0
             logging.info("Reset, select new target")
 
         # --- SAM2: Initialize (bbox) ---
@@ -332,30 +344,29 @@ try:
                 # Blend original color + red
                 colors[highlight] = colors[highlight] * 0.2 + MASK_COLOR_RGB * 0.8
 
-                # --- 6D BBox: PCA + axis consistency + EMA smoothing ---
+                # --- 6D BBox: PCA + axis consistency + extent stabilization ---
                 obj_pts = points_3d[highlight]
                 if len(obj_pts) >= 10:
-                    # 90% outlier filtering
+                    # 90% outlier filtering (same as original)
                     centroid = obj_pts.mean(axis=0)
                     dists = np.linalg.norm(obj_pts - centroid, axis=1)
                     thresh = np.percentile(dists, 90)
                     filtered = obj_pts[dists <= thresh]
 
                     if len(filtered) >= 10:
-                        # PCA for principal axes
+                        # PCA for principal axes (same as original)
                         center = filtered.mean(axis=0)
                         cov = np.cov((filtered - center).T)
                         eigenvalues, eigenvectors = np.linalg.eigh(cov)
-                        # eigh returns ascending order, flip to descending
                         idx = np.argsort(eigenvalues)[::-1]
                         eigenvalues = eigenvalues[idx]
-                        axes = eigenvectors[:, idx]  # 3x3, columns are principal axes
+                        axes = eigenvectors[:, idx]
 
                         # Ensure right-hand coordinate system
                         if np.linalg.det(axes) < 0:
                             axes[:, 2] = -axes[:, 2]
 
-                        # Axis direction consistency: compare with previous frame, flip if reversed
+                        # Axis direction consistency (same as original)
                         if prev_axes is not None:
                             for i in range(3):
                                 if np.dot(axes[:, i], prev_axes[:, i]) < 0:
@@ -364,14 +375,16 @@ try:
 
                         # Compute extent in principal axis coordinate system
                         local = (filtered - center) @ axes
-                        extent = local.max(axis=0) - local.min(axis=0)
+                        raw_extent = local.max(axis=0) - local.min(axis=0)
                         local_center_offset = (local.max(axis=0) + local.min(axis=0)) / 2
                         center = center + axes @ local_center_offset
 
-                        # EMA smoothing
+                        # === Smoothing: original EMA for center & rotation, stabilized for extent ===
+                        extent_frame_count += 1
+
                         if obb_smooth_center is not None:
+                            # Center & rotation: original EMA
                             obb_smooth_center = OBB_SMOOTH * center + (1 - OBB_SMOOTH) * obb_smooth_center
-                            obb_smooth_extent = OBB_SMOOTH * extent + (1 - OBB_SMOOTH) * obb_smooth_extent
                             obb_smooth_R = OBB_SMOOTH * axes + (1 - OBB_SMOOTH) * obb_smooth_R
                             # Re-orthogonalize (Gram-Schmidt)
                             u0 = obb_smooth_R[:, 0]
@@ -380,10 +393,26 @@ try:
                             u1 = u1 / np.linalg.norm(u1)
                             u2 = np.cross(u0, u1)
                             obb_smooth_R = np.column_stack([u0, u1, u2])
+
+                            # Extent: decaying alpha + median + clamp (rigid body stabilization)
+                            extent_history.append(raw_extent.copy())
+                            ext_alpha = max(EXTENT_ALPHA_MIN,
+                                            EXTENT_ALPHA_INIT * (EXTENT_ALPHA_DECAY ** extent_frame_count))
+                            if len(extent_history) >= 3:
+                                median_ext = np.median(np.array(extent_history), axis=0)
+                                candidate_extent = 0.5 * raw_extent + 0.5 * median_ext
+                            else:
+                                candidate_extent = raw_extent
+                            max_delta = obb_smooth_extent * EXTENT_MAX_CHANGE_RATE
+                            delta = candidate_extent - obb_smooth_extent
+                            clamped_extent = obb_smooth_extent + np.clip(delta, -max_delta, max_delta)
+                            obb_smooth_extent = ext_alpha * clamped_extent + (1 - ext_alpha) * obb_smooth_extent
                         else:
+                            # First frame: initialize everything
                             obb_smooth_center = center.copy()
-                            obb_smooth_extent = extent.copy()
+                            obb_smooth_extent = raw_extent.copy()
                             obb_smooth_R = axes.copy()
+                            extent_history.append(raw_extent.copy())
 
                         # Generate 8 corners from smoothed center/extent/R
                         half = obb_smooth_extent / 2
@@ -419,6 +448,13 @@ try:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         if sam2_initialized:
             status = "TRACKING | r=reset q=quit"
+            if obb_smooth_extent is not None:
+                ext = obb_smooth_extent
+                ext_alpha = max(EXTENT_ALPHA_MIN,
+                                EXTENT_ALPHA_INIT * (EXTENT_ALPHA_DECAY ** extent_frame_count))
+                ext_str = f"BBox: {ext[0]*100:.1f}x{ext[1]*100:.1f}x{ext[2]*100:.1f}cm a={ext_alpha:.3f}"
+                cv2.putText(display, ext_str, (10, IMG_HEIGHT - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         else:
             status = "Draw bbox / Click to select | q=quit"
         cv2.putText(display, status, (10, 25),
