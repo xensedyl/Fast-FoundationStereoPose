@@ -12,6 +12,8 @@ Controls (focus on OpenCV window):
   - Left-click drag: Draw bounding box → initialize tracking
   - Left-click: Select foreground point → initialize tracking
   - r: Reset selection
+  - a: Save current segmented point cloud (.ply, original RGB colors)
+  - s: Save current global point cloud (.ply)
   - p: Toggle IR projector
   - q: Quit
 """
@@ -253,12 +255,19 @@ cv2.setMouseCallback("RGB + SAM2", mouse_callback)
 first_frame = True
 frame_count = 0
 
-logging.info("Drag/click to select target, r=reset, p=toggle IR projector, q=quit")
+logging.info("Drag/click to select target, r=reset, s=save global, a=save segmented, p=toggle IR projector, q=quit")
 
 # ===== 8. Main loop =====
+seg_points_3d = np.zeros((0, 3), dtype=np.float64)
+seg_colors_rgb = np.zeros((0, 3), dtype=np.float64)
+
 try:
     while True:
         t0 = time.time()
+
+        # Reset segmented cloud cache for this frame
+        seg_points_3d = np.zeros((0, 3), dtype=np.float64)
+        seg_colors_rgb = np.zeros((0, 3), dtype=np.float64)
 
         # Capture frames from RealSense
         frames = pipeline.wait_for_frames()
@@ -375,6 +384,7 @@ try:
 
         colors = np.zeros((len(z), 3), dtype=np.float64)
         colors[in_bounds] = color_bgr[v_rgb[in_bounds], u_rgb[in_bounds], ::-1].astype(np.float64) / 255.0
+        colors_raw = colors.copy()  # Keep original RGB colors for segmented-cloud export
 
         # --- Point cloud highlight: Map SAM2 mask (RGB space) to IR space ---
         if current_mask is not None and np.any(current_mask):
@@ -382,6 +392,10 @@ try:
             highlight[in_bounds] = current_mask[v_rgb[in_bounds], u_rgb[in_bounds]] > 0
 
             if np.any(highlight):
+                # Cache segmented points/colors before visual highlight color blending
+                seg_points_3d = points_3d[highlight].astype(np.float64)
+                seg_colors_rgb = colors_raw[highlight].astype(np.float64)
+
                 colors[highlight] = colors[highlight] * 0.2 + MASK_COLOR_RGB * 0.8
 
                 # --- 6D BBox: PCA + axis consistency + extent stabilization ---
@@ -476,16 +490,16 @@ try:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         ir_status = "IR:ON" if ir_projector_enabled else "IR:OFF"
         if sam2_initialized:
-            status = f"TRACKING | {ir_status} | r=reset p=IR q=quit"
+            status = f"TRACKING | {ir_status} | r=reset s=save_all a=save_seg p=IR q=quit"
             if obb_smooth_extent is not None:
                 ext = obb_smooth_extent
                 ext_alpha = max(EXTENT_ALPHA_MIN,
                                 EXTENT_ALPHA_INIT * (EXTENT_ALPHA_DECAY ** extent_frame_count))
-                ext_str = f"BBox: {ext[0]*100:.1f}x{ext[1]*100:.1f}x{ext[2]*100:.1f}cm a={ext_alpha:.3f}"
+                ext_str = f"BBox: {ext[0]*100:.1f}x{ext[1]*100:.1f}x{ext[2]*100:.1f}cm alpha={ext_alpha:.3f}"
                 cv2.putText(display, ext_str, (10, IMG_HEIGHT - 15),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         else:
-            status = f"Draw bbox / Click to select | {ir_status} | q=quit"
+            status = f"Draw bbox / Click to select | {ir_status} | s=save_all a=save_seg q=quit"
         cv2.putText(display, status, (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
@@ -516,6 +530,29 @@ try:
             break
         elif key == ord('r'):
             need_reset = True
+        elif key == ord('a'):
+            script_dir = os.path.dirname(os.path.realpath(__file__))
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            save_path = os.path.join(script_dir, f"d415_segmented_cloud_{timestamp}.ply")
+
+            if len(seg_points_3d) > 0:
+                seg_pcd = o3d.geometry.PointCloud()
+                seg_pcd.points = o3d.utility.Vector3dVector(seg_points_3d)
+                seg_pcd.colors = o3d.utility.Vector3dVector(seg_colors_rgb)
+                if o3d.io.write_point_cloud(save_path, seg_pcd):
+                    logging.info(f"Saved segmented point cloud: {save_path}")
+                else:
+                    logging.warning("Failed to save segmented point cloud (write error)")
+            else:
+                logging.warning("No segmented points in current frame")
+        elif key == ord('s'):
+            script_dir = os.path.dirname(os.path.realpath(__file__))
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            save_path = os.path.join(script_dir, f"d415_global_cloud_{timestamp}.ply")
+            if len(pcd.points) > 0 and o3d.io.write_point_cloud(save_path, pcd):
+                logging.info(f"Saved global point cloud: {save_path}")
+            else:
+                logging.warning("Failed to save global point cloud (empty or write error)")
         elif key == ord('p'):
             # Toggle IR projector
             ir_projector_enabled = not ir_projector_enabled
